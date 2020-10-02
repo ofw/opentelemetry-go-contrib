@@ -18,6 +18,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"sync"
 
 	"go.opentelemetry.io/otel/api/propagation"
 	"go.opentelemetry.io/otel/api/trace"
@@ -84,7 +85,6 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 	opts := append([]trace.SpanOption{}, t.spanStartOptions...) // start with the configured options
 
 	ctx, span := t.tracer.Start(r.Context(), t.spanNameFormatter("", r), opts...)
-	defer span.End()
 
 	r = r.WithContext(ctx)
 	span.SetAttributes(semconv.HTTPClientAttributesFromHTTPRequest(r)...)
@@ -93,6 +93,7 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 	res, err := t.rt.RoundTrip(r)
 	if err != nil {
 		span.RecordError(ctx, err, trace.WithErrorStatus(codes.Internal))
+		span.End()
 		return res, err
 	}
 
@@ -104,9 +105,10 @@ func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 type wrappedBody struct {
-	ctx  context.Context
-	span trace.Span
-	body io.ReadCloser
+	ctx     context.Context
+	span    trace.Span
+	body    io.ReadCloser
+	endOnce sync.Once
 }
 
 var _ io.ReadCloser = &wrappedBody{}
@@ -118,14 +120,20 @@ func (wb *wrappedBody) Read(b []byte) (int, error) {
 	case nil:
 		// nothing to do here but fall through to the return
 	case io.EOF:
-		wb.span.End()
+		wb.end()
 	default:
 		wb.span.RecordError(wb.ctx, err, trace.WithErrorStatus(codes.Internal))
 	}
 	return n, err
 }
 
+func (wb *wrappedBody) end() {
+	wb.endOnce.Do(func() {
+		wb.span.End()
+	})
+}
+
 func (wb *wrappedBody) Close() error {
-	wb.span.End()
+	wb.end()
 	return wb.body.Close()
 }
